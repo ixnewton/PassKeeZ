@@ -8,6 +8,7 @@ const i18n = @import("../i18n.zig");
 const State = @import("../state.zig");
 const Uuid = @import("uuid");
 const cbor = @import("zbor");
+const FolderEntry = @import("FolderEntry.zig").FolderEntry;
 
 pub fn Database(
     path: []const u8,
@@ -24,6 +25,10 @@ pub fn Database(
         .getCredential = getCredential,
         .setCredential = setCredential,
         .deleteCredential = deleteCredential,
+        .getFolder = getFolder,
+        .listFolders = listFolders,
+        .setFolder = setFolder,
+        .deleteFolder = deleteFolder,
     };
 }
 
@@ -405,4 +410,183 @@ fn credentialFromEntry(entry: *const kdbx.Entry) !keylib.ctap.authenticator.Cred
         .discoverable = true,
         .policy = .userVerificationOptional,
     };
+}
+
+// ----------------- Folder Management ----------------------
+
+fn getFolder(self: *const TDatabase, id: [36]u8) TDatabase.Error!FolderEntry {
+    var db = @as(*kdbx.Database, @ptrCast(@alignCast(self.db.?)));
+    
+    // Search for folder entry in "Encrypted Folders" group
+    const folders_group = db.body.root.findGroupByName("Encrypted Folders") orelse {
+        return TDatabase.Error.DoesNotExist;
+    };
+    
+    const id_str = std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&id)}) catch {
+        return TDatabase.Error.OutOfMemory;
+    };
+    defer self.allocator.free(id_str);
+    
+    for (folders_group.entries.items) |*entry| {
+        if (entry.get("PassKeeZ.FolderID")) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id_str)) {
+                // Found the folder, deserialize it
+                if (entry.get("PassKeeZ.FolderData")) |data| {
+                    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch {
+                        return TDatabase.Error.DatabaseError;
+                    };
+                    const decoded = self.allocator.alloc(u8, decoded_len) catch {
+                        return TDatabase.Error.OutOfMemory;
+                    };
+                    defer self.allocator.free(decoded);
+                    
+                    std.base64.standard.Decoder.decode(decoded, data) catch {
+                        return TDatabase.Error.DatabaseError;
+                    };
+                    
+                    return FolderEntry.fromKdbxEntry(self.allocator, decoded) catch {
+                        return TDatabase.Error.DatabaseError;
+                    };
+                }
+            }
+        }
+    }
+    
+    return TDatabase.Error.DoesNotExist;
+}
+
+fn listFolders(self: *const TDatabase, allocator: std.mem.Allocator) TDatabase.Error![]FolderEntry {
+    var db = @as(*kdbx.Database, @ptrCast(@alignCast(self.db.?)));
+    
+    const folders_group = db.body.root.findGroupByName("Encrypted Folders") orelse {
+        // No folders group exists, return empty list
+        return allocator.alloc(FolderEntry, 0) catch return TDatabase.Error.OutOfMemory;
+    };
+    
+    var folders = std.ArrayList(FolderEntry).init(allocator);
+    errdefer {
+        for (folders.items) |*folder| {
+            folder.deinit(allocator);
+        }
+        folders.deinit();
+    }
+    
+    for (folders_group.entries.items) |*entry| {
+        if (entry.get("PassKeeZ.FolderData")) |data| {
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch continue;
+            const decoded = allocator.alloc(u8, decoded_len) catch continue;
+            defer allocator.free(decoded);
+            
+            std.base64.standard.Decoder.decode(decoded, data) catch continue;
+            
+            const folder = FolderEntry.fromKdbxEntry(allocator, decoded) catch continue;
+            folders.append(folder) catch continue;
+        }
+    }
+    
+    return folders.toOwnedSlice() catch return TDatabase.Error.OutOfMemory;
+}
+
+fn setFolder(self: *const TDatabase, folder: FolderEntry) TDatabase.Error!void {
+    var db = @as(*kdbx.Database, @ptrCast(@alignCast(self.db.?)));
+    
+    // Ensure "Encrypted Folders" group exists
+    const folders_group = db.body.root.findGroupByName("Encrypted Folders") orelse blk: {
+        const grp = kdbx.Group.new("Encrypted Folders", self.allocator) catch {
+            return TDatabase.Error.DatabaseError;
+        };
+        db.body.root.addGroup(grp) catch {
+            return TDatabase.Error.DatabaseError;
+        };
+        break :blk db.body.root.findGroupByName("Encrypted Folders").?;
+    };
+    
+    // Serialize folder entry
+    const serialized = folder.toKdbxEntry(self.allocator) catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    defer self.allocator.free(serialized);
+    
+    // Base64 encode the serialized data
+    const encoded_len = std.base64.standard.Encoder.calcSize(serialized.len);
+    const encoded = self.allocator.alloc(u8, encoded_len) catch {
+        return TDatabase.Error.OutOfMemory;
+    };
+    defer self.allocator.free(encoded);
+    
+    const encoded_data = std.base64.standard.Encoder.encode(encoded, serialized);
+    
+    const id_str = std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&folder.id)}) catch {
+        return TDatabase.Error.OutOfMemory;
+    };
+    defer self.allocator.free(id_str);
+    
+    // Check if entry already exists
+    for (folders_group.entries.items) |*entry| {
+        if (entry.get("PassKeeZ.FolderID")) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id_str)) {
+                // Update existing entry
+                entry.set("PassKeeZ.FolderData", encoded_data) catch {
+                    return TDatabase.Error.DatabaseError;
+                };
+                entry.set("Title", folder.name) catch {
+                    return TDatabase.Error.DatabaseError;
+                };
+                save(self, self.allocator) catch {
+                    return TDatabase.Error.Other;
+                };
+                return;
+            }
+        }
+    }
+    
+    // Create new entry
+    const entry = kdbx.Entry.new(folder.name, self.allocator) catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    
+    entry.set("PassKeeZ.FolderID", id_str) catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    entry.set("PassKeeZ.FolderData", encoded_data) catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    entry.set("Notes", "PassKeeZ Encrypted Folder") catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    
+    folders_group.addEntry(entry) catch {
+        return TDatabase.Error.DatabaseError;
+    };
+    
+    save(self, self.allocator) catch {
+        return TDatabase.Error.Other;
+    };
+}
+
+fn deleteFolder(self: *const TDatabase, id: [36]u8) TDatabase.Error!void {
+    var db = @as(*kdbx.Database, @ptrCast(@alignCast(self.db.?)));
+    
+    const folders_group = db.body.root.findGroupByName("Encrypted Folders") orelse {
+        return TDatabase.Error.DoesNotExist;
+    };
+    
+    const id_str = std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&id)}) catch {
+        return TDatabase.Error.OutOfMemory;
+    };
+    defer self.allocator.free(id_str);
+    
+    for (folders_group.entries.items, 0..) |*entry, i| {
+        if (entry.get("PassKeeZ.FolderID")) |entry_id| {
+            if (std.mem.eql(u8, entry_id, id_str)) {
+                _ = folders_group.entries.orderedRemove(i);
+                save(self, self.allocator) catch {
+                    return TDatabase.Error.Other;
+                };
+                return;
+            }
+        }
+    }
+    
+    return TDatabase.Error.DoesNotExist;
 }

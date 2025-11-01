@@ -6,6 +6,7 @@ const UpResult = keylib.ctap.authenticator.callbacks.UpResult;
 const UvResult = keylib.ctap.authenticator.callbacks.UvResult;
 const i18n = @import("i18n.zig");
 const misc = @import("database/misc.zig");
+const folder_mgmt = @import("folder_mgmt.zig");
 
 pub var conf: Config = undefined;
 
@@ -17,6 +18,9 @@ pub var conf: Config = undefined;
 /// TODO: currently the main thread uses the database only for reading
 ///       but we probably need a lock in the future.
 pub var database: ?Database = null;
+
+/// Folder manager for encrypted folders
+pub var folder_manager: ?folder_mgmt.FolderManager = null;
 
 pub var uv_result = UvResult.Denied;
 pub var up_result: ?UpResult = null;
@@ -194,6 +198,12 @@ pub fn authenticate(a: std.mem.Allocator) !void {
                 uv_result = UvResult.AcceptedWithUp;
                 up_result = UpResult.Accepted;
                 database = db;
+                
+                // Initialize folder manager and auto-mount folders
+                initFolderManager(a) catch |e| {
+                    std.log.err("Failed to initialize folder manager: {any}", .{e});
+                };
+                
                 return;
             },
             else => {
@@ -227,10 +237,61 @@ pub fn authenticate(a: std.mem.Allocator) !void {
 }
 
 pub fn deinit() void {
+    // Unmount all folders before closing database
+    if (folder_manager) |*fm| {
+        fm.unmountAll();
+        fm.deinit();
+        folder_manager = null;
+    }
+    
     if (database) |*db| {
         db.deinit(db);
     }
     ts = null;
     uv_result = UvResult.Denied;
     up_result = null;
+}
+
+/// Initialize folder manager and auto-mount configured folders
+fn initFolderManager(allocator: std.mem.Allocator) !void {
+    if (database == null) return;
+    
+    var manager = folder_mgmt.FolderManager.init(allocator);
+    
+    // Load folders from database
+    const folders = database.?.listFolders(&database.?, allocator) catch |e| {
+        std.log.err("Failed to load folders from database: {any}", .{e});
+        return e;
+    };
+    defer {
+        for (folders) |*folder| {
+            folder.deinit(allocator);
+        }
+        allocator.free(folders);
+    }
+    
+    // Add folders to manager
+    for (folders) |folder| {
+        const encrypted_folder = folder_mgmt.EncryptedFolder{
+            .id = folder.id,
+            .name = try allocator.dupe(u8, folder.name),
+            .encrypted_path = try allocator.dupe(u8, folder.encrypted_path),
+            .mount_point = try allocator.dupe(u8, folder.mount_point),
+            .key = folder.key,
+            .salt = folder.salt,
+            .created_at = folder.created_at,
+            .last_accessed = folder.last_accessed,
+            .is_mounted = false,
+        };
+        try manager.folders.append(encrypted_folder);
+    }
+    
+    // Auto-mount folders that were previously mounted
+    for (manager.folders.items) |*folder| {
+        manager.mountFolder(folder.id) catch |e| {
+            std.log.warn("Failed to auto-mount folder {s}: {any}", .{ folder.name, e });
+        };
+    }
+    
+    folder_manager = manager;
 }

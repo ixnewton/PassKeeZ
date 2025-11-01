@@ -1,6 +1,7 @@
 const std = @import("std");
 const keylib = @import("keylib");
 const Credential = keylib.ctap.authenticator.Credential;
+const FolderEntry = @import("database/FolderEntry.zig").FolderEntry;
 
 pub const kdbx = @import("database/kdbx.zig");
 
@@ -48,6 +49,27 @@ setCredential: *const fn (
 ) Error!void,
 
 deleteCredential: *const fn (
+    *const Self,
+    id: [36]u8,
+) Error!void,
+
+// Folder management functions
+getFolder: *const fn (
+    *const Self,
+    id: [36]u8,
+) Error!FolderEntry,
+
+listFolders: *const fn (
+    *const Self,
+    allocator: std.mem.Allocator,
+) Error![]FolderEntry,
+
+setFolder: *const fn (
+    *const Self,
+    folder: FolderEntry,
+) Error!void,
+
+deleteFolder: *const fn (
     *const Self,
     id: [36]u8,
 ) Error!void,
